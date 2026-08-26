@@ -141,6 +141,7 @@ InputFFDevice::InputFFDevice()
                 && strcmp(name, "aw8695_haptic")
                 && strcmp(name, "aw8697_haptic")
                 && strcmp(name, "awinic_haptic")
+                && strcmp(name, "drv260x:haptics")
                 && strcmp(name, "drv2624:haptics")
                 && strcmp(name, "haptic_rt")
                 && strcmp(name, "si_haptic")) {
@@ -328,15 +329,15 @@ int InputFFDevice::off() {
 }
 
 int InputFFDevice::setAmplitude(uint8_t amplitude) {
-    int tmp, ret;
+    int32_t tmp;
+    int ret;
     struct input_event ie;
 
     /* For QMAA compliance, return OK even if vibrator device doesn't exist */
     if (!isPresent())
         return 0;
 
-    tmp = amplitude * (STRONG_MAGNITUDE - LIGHT_MAGNITUDE) / 255;
-    tmp += LIGHT_MAGNITUDE;
+    tmp = amplitude * STRONG_MAGNITUDE / 255;
     ie.type = EV_FF;
     ie.code = FF_GAIN;
     ie.value = tmp;
@@ -375,7 +376,7 @@ int InputFFDevice::playEffect(int effectId, EffectStrength es, long *playLengthM
 }
 
 int InputFFDevice::playPrimitive(int primitiveId, float amplitude, long *playLengthMs) {
-    int8_t tmp;
+    int32_t tmp;
     int ret = 0;
 
     if (primitiveId > MAX_PATTERN_ID) {
@@ -384,9 +385,8 @@ int InputFFDevice::playPrimitive(int primitiveId, float amplitude, long *playLen
     }
 
     primitiveId |= PRIMITIVE_ID_MASK;
-    tmp = (uint8_t)(amplitude * 0xff);
-    mCurrMagnitude = tmp * (STRONG_MAGNITUDE - LIGHT_MAGNITUDE) / 255;
-    mCurrMagnitude += LIGHT_MAGNITUDE;
+    tmp = (uint8_t)(amplitude * 0xff) * STRONG_MAGNITUDE / 255;
+    mCurrMagnitude = tmp;
 
     ret = play(primitiveId, INVALID_VALUE, playLengthMs);
     if (ret != 0)
@@ -400,6 +400,7 @@ LedVibratorDevice::LedVibratorDevice() {
     int fd;
 
     mDetected = false;
+    mIsLdo = false;
 
     snprintf(devicename, sizeof(devicename), "%s/%s", LED_DEVICE, "activate");
     fd = TEMP_FAILURE_RETRY(open(devicename, O_RDWR));
@@ -409,6 +410,9 @@ LedVibratorDevice::LedVibratorDevice() {
     }
 
     mDetected = true;
+
+    snprintf(devicename, sizeof(devicename), "%s/%s", LED_DEVICE, "device/driver");
+    mIsLdo = realpath(devicename, devicename) && strstr(devicename, "/qcom,qpnp-vibrator-ldo");
 }
 
 int LedVibratorDevice::write_value(const char *file, const char *value) {
@@ -574,8 +578,14 @@ ndk::ScopedAStatus VibratorOL::getCapabilities(int32_t* _aidl_return) {
         *_aidl_return |= IVibrator::CAP_PERFORM_CALLBACK;
         int32_t primitiveDuration = 0;
         uint32_t primitiveId = static_cast<uint32_t>(CompositePrimitive::CLICK);
+#ifndef USE_EFFECT_STREAM
         getPrimitiveDurationFromSysfs(primitiveId, &primitiveDuration);
         if (primitiveDuration != 0)
+#else
+        std::vector<CompositePrimitive> supportedPrimitives;
+        getSupportedPrimitives(&supportedPrimitives);
+        if (supportedPrimitives.size() > 0)
+#endif
             *_aidl_return |= IVibrator::CAP_COMPOSE_EFFECTS;
     }
     if (ff.mSupportExternalControl)
@@ -611,6 +621,11 @@ ndk::ScopedAStatus VibratorOL::off() {
 ndk::ScopedAStatus VibratorOL::on(int32_t timeoutMs,
                                 const std::shared_ptr<IVibratorCallback>& callback) {
     int ret;
+
+    if (ledVib.mIsLdo) {
+        // See QPNP_VIB_MIN_PLAY_MS, QPNP_VIB_MAX_PLAY_MS in leds-qpnp-vibrator-ldo.c
+        timeoutMs = std::clamp(timeoutMs, 50, 15000);
+    }
 
     ALOGD("Vibrator on for timeoutMs: %d", timeoutMs);
     if (ledVib.mDetected)
@@ -754,6 +769,7 @@ ndk::ScopedAStatus VibratorOL::getCompositionSizeMax(int32_t* maxSize) {
 }
 
 ndk::ScopedAStatus VibratorOL::getSupportedPrimitives(std::vector<CompositePrimitive>* supported) {
+#ifndef USE_EFFECT_STREAM
     *supported =  {
         CompositePrimitive::NOOP,   CompositePrimitive::CLICK,
         CompositePrimitive::THUD,   CompositePrimitive::SPIN,
@@ -761,6 +777,18 @@ ndk::ScopedAStatus VibratorOL::getSupportedPrimitives(std::vector<CompositePrimi
         CompositePrimitive::QUICK_FALL, CompositePrimitive::LIGHT_TICK,
         CompositePrimitive::LOW_TICK,
     };
+#else
+    for (int32_t primitiveId = static_cast<int32_t>(CompositePrimitive::NOOP);
+         primitiveId <= static_cast<int32_t>(CompositePrimitive::LOW_TICK);
+         primitiveId++) {
+        const struct effect_stream *stream;
+        int32_t effectId  = primitiveId | PRIMITIVE_ID_MASK;
+
+        stream = get_effect_stream(effectId);
+        if (stream)
+            supported->push_back(static_cast<CompositePrimitive>(primitiveId));
+    }
+#endif
     return ndk::ScopedAStatus::ok();
 }
 
